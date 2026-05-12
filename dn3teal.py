@@ -334,6 +334,7 @@ def main() -> None:
 
     # filename -> list of base64 data chunks
     received: Dict[str, List[bytes]] = OrderedDict()
+    seen_qnames = set()
     unnamed_counter = 0
 
     try:
@@ -350,6 +351,17 @@ def main() -> None:
             labels = parse_labels(packet)
             if not labels:
                 continue
+
+            # In delegated-domain mode, recursive resolvers may retry or
+            # forward the same DNS question from multiple resolver IPs.
+            # Deduplicate by full QNAME so the same query is not counted twice.
+            qname_key = b".".join(labels).lower()
+            if qname_key in seen_qnames:
+                if args.v:
+                    pretty = qname_key.decode("latin-1", "replace")
+                    print(f"{C.Y}[~] duplicate ignored from {addr[0]} -> {pretty}{C.N}")
+                continue
+            seen_qnames.add(qname_key)
 
             filename, chunks = extract_payload(labels)
 
