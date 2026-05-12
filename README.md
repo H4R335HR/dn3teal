@@ -1,14 +1,6 @@
-# DNSteal Python 3 Port
+# DN3teal
 
 A modern Python 3 port of [m57/dnsteal](https://github.com/m57/dnsteal) with enhanced reliability and educational features.
-
-## Features
-
-- **Python 3 compatibility** - Complete rewrite for modern Python
-- **Auto-optimized chunks** - Dynamic DNS query sizing prevents errors  
-- **Contextual help** - Shows working commands for your configuration
-- **Cross-platform** - Reliable `fold` instead of problematic `sed`
-- **Educational focus** - Built for controlled training environments
 
 ## Quick Start
 
